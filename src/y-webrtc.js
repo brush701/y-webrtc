@@ -11,6 +11,8 @@ import * as bc from 'lib0/broadcastchannel'
 import * as buffer from 'lib0/buffer'
 import * as math from 'lib0/math'
 import { createMutex } from 'lib0/mutex'
+import { createHash, createPublicKey, sign, verify } from 'crypto'
+import { Issuer } from 'openid-client'
 
 import * as Y from 'yjs' // eslint-disable-line
 import Peer from 'simple-peer/simplepeer.min.js'
@@ -26,6 +28,9 @@ const messageSync = 0
 const messageQueryAwareness = 3
 const messageAwareness = 1
 const messageBcPeerId = 4
+const messageAuthRequest = 5
+const messageAuthResponse = 6
+const messageAuthResult = 7
 
 /**
  * @type {Map<string, SignalingConn>}
@@ -127,16 +132,116 @@ const readMessage = (room, buf, syncedCallback) => {
 /**
  * @param {WebrtcConn} peerConn
  * @param {Uint8Array} buf
- * @return {encoding.Encoder?}
+ * @return {Promise<boolean>}
  */
-const readPeerMessage = (peerConn, buf) => {
-  const room = peerConn.room
-  log('received message from ', logging.BOLD, peerConn.remotePeerId, logging.GREY, ' (', room.name, ')', logging.UNBOLD, logging.UNCOLOR)
-  return readMessage(room, buf, () => {
-    peerConn.synced = true
-    log('synced ', logging.BOLD, room.name, logging.UNBOLD, ' with ', logging.BOLD, peerConn.remotePeerId)
-    checkIsSynced(room)
-  })
+const authenticate = async (peerConn, buf) => {
+  if (peerConn.authenticated) {
+    return true
+  } else {
+    const decoder = decoding.createDecoder(buf)
+    const encoder = encoding.createEncoder()
+    const messageType = decoding.readVarUint(decoder)
+    const room = peerConn.room
+    if (room === undefined) {
+      return null
+    }
+    switch (messageType) {
+      case messageAuthRequest:
+        const { idToken, challenge } = decoding.readAny(decoder)
+        // Remote peer verifies id token and sends back nonce signed with private key
+    
+        // check if idToken is valid by hitting introspection endpoint
+        // TODO: load provider url from ACL
+        const provider = await Issuer.discover(idToken.iss)
+        const client = new provider.Client({
+          client_id: peerConn.room.provider.clientId,
+          redirect_uris: peerConn.room.provider.redirectUris,
+          response_types: ["id_token"]
+        })
+        
+        const userInfo = await client.introspect(idToken, "id_token")
+        if (userInfo.sub !== idToken.sub) {
+          throw new Error('idToken is invalid')
+        }
+
+        peerConn.jkt = userInfo.jkt
+
+        // sign nonce with private key
+        const response = sign("ECDSA", challenge, { key: peerConn.room.provider.jwk, format: "jwk" })
+
+        encoding.writeVarUint(encoder, messageAuthResponse)
+        encoding.writeAny(encoder, { signature: response, pub: peerConn.room.provider.publicKey})
+        sendWebrtcConn(peerConn, encoder)
+        return false
+      case messageAuthResponse:
+        // Local peer verifies nonce signed with public key
+        const { signature, pub} = decoding.readAny(decoder)
+        // verify signature
+        let valid = verify("ECDSA", peerConn.nonce, pub, signature)
+
+        // compute the base64 encoded expression of the JWK SHA-256 Thumbprint of the public key
+        const sha256 = createHash('sha256')
+        sha256.update(pub)
+        const jkt = sha256.digest('base64')
+
+        //check that the jkt is the same
+        valid = valid && jkt === peerConn.jkt
+
+        encoding.writeVarUint(encoder, messageAuthResult)
+        valid ? encoding.writeVarString(encoder, 'OK') : encoding.writeVarString(encoder, 'ERROR')
+        sendWebrtcConn(peerConn, encoder)
+        return false
+      case messageAuthResult:
+        // If both peers are verified, they are connected
+        const result = decoding.readVarString(decoder)
+        if (result !== 'OK') {
+          log('authentication failed ', logging.BOLD, room.name, logging.UNBOLD, ' with ', logging.BOLD, peerConn.remotePeerId)
+          throw new Error('authentication failed')
+        } else {
+          peerConn.authenticated = true
+          log('authenticated ', logging.BOLD, room.name, logging.UNBOLD, ' with ', logging.BOLD, peerConn.remotePeerId)
+          // send sync step 1
+          const provider = room.provider
+          const doc = provider.doc
+          const awareness = room.awareness
+          const encoder = encoding.createEncoder()
+          encoding.writeVarUint(encoder, messageSync)
+          syncProtocol.writeSyncStep1(encoder, doc)
+          sendWebrtcConn(this, encoder)
+          const awarenessStates = awareness.getStates()
+          if (awarenessStates.size > 0) {
+            const encoder = encoding.createEncoder()
+            encoding.writeVarUint(encoder, messageAwareness)
+            encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, Array.from(awarenessStates.keys())))
+            sendWebrtcConn(this, encoder)
+          }
+          return true
+        }
+      default:
+        console.error('Unable to authenticate peer ' + peerConn.remotePeerId)
+        return false
+    }
+  }
+}
+
+/**
+ * @param {WebrtcConn} peerConn
+ * @param {Uint8Array} buf
+ * @return {Promise<encoding.Encoder>?}
+ */
+const readPeerMessage = async (peerConn, buf) => {
+  const authenticated = await authenticate(peerConn, buf)
+  if (!authenticated) {
+    return null
+  } else {
+    const room = peerConn.room
+    log('received message from ', logging.BOLD, peerConn.remotePeerId, logging.GREY, ' (', room.name, ')', logging.UNBOLD, logging.UNCOLOR)
+    return readMessage(room, buf, () => {
+      peerConn.synced = true
+      log('synced ', logging.BOLD, room.name, logging.UNBOLD, ' with ', logging.BOLD, peerConn.remotePeerId)
+      checkIsSynced(room)
+    })
+  }
 }
 
 /**
@@ -177,6 +282,8 @@ export class WebrtcConn {
     this.closed = false
     this.connected = false
     this.synced = false
+    this.authenticated = false
+    this.jkt = null
     /**
      * @type {any}
      */
@@ -185,23 +292,13 @@ export class WebrtcConn {
       publishSignalingMessage(signalingConn, room, { to: remotePeerId, from: room.peerId, type: 'signal', signal })
     })
     this.peer.on('connect', () => {
-      log('connected to ', logging.BOLD, remotePeerId)
       this.connected = true
-      // send sync step 1
-      const provider = room.provider
-      const doc = provider.doc
-      const awareness = room.awareness
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, messageSync)
-      syncProtocol.writeSyncStep1(encoder, doc)
-      sendWebrtcConn(this, encoder)
-      const awarenessStates = awareness.getStates()
-      if (awarenessStates.size > 0) {
-        const encoder = encoding.createEncoder()
-        encoding.writeVarUint(encoder, messageAwareness)
-        encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, Array.from(awarenessStates.keys())))
-        sendWebrtcConn(this, encoder)
-      }
+      // Send id token + nonce to remote peer
+      const idEncoder = encoding.createEncoder()
+      this.nonce = crypto.getRandomValues(new Uint8Array(16))
+      encoding.writeVarUint(idEncoder, messageAuthRequest)
+      encoding.writeAny(idEncoder, {idToken: this.room.provider.idToken, challenge: this.nonce})
+      sendWebrtcConn(this, idEncoder)
     })
     this.peer.on('close', () => {
       this.connected = false
@@ -225,10 +322,11 @@ export class WebrtcConn {
       announceSignalingInfo(room)
     })
     this.peer.on('data', data => {
-      const answer = readPeerMessage(this, data)
-      if (answer !== null) {
-        sendWebrtcConn(this, answer)
-      }
+      readPeerMessage(this, data).then(answer => {
+        if (answer !== null) {
+          sendWebrtcConn(this, answer)
+        }
+      })
     })
   }
 
@@ -545,6 +643,14 @@ export class SignalingConn extends ws.WebsocketClient {
  * @property {boolean} [filterBcConns]
  * @property {any} [peerOpts]
  */
+ 
+/**
+ * @typedef {Object} AuthenticationOptions
+ * @property {Object} [idToken]
+ * @property {Object} [jwk]
+ * @property {string} [clientId]
+ * @property {string[]} [redirectUris]
+ */
 
 /**
  * @extends Observable<string>
@@ -554,6 +660,7 @@ export class WebrtcProvider extends Observable {
    * @param {string} roomName
    * @param {Y.Doc} doc
    * @param {ProviderOptions?} opts
+   * @param {AuthenticationOptions?} authOpts
    */
   constructor (
     roomName,
@@ -564,7 +671,13 @@ export class WebrtcProvider extends Observable {
       awareness = new awarenessProtocol.Awareness(doc),
       maxConns = 20 + math.floor(random.rand() * 15), // the random factor reduces the chance that n clients form a cluster
       filterBcConns = true,
-      peerOpts = {} // simple-peer options. See https://github.com/feross/simple-peer#peer--new-peeropts
+      peerOpts = {}, // simple-peer options. See https://github.com/feross/simple-peer#peer--new-peeropts
+    } = {},
+    {
+      idToken = null,
+      jwk = null,
+      clientId = null,
+      redirectUris = null
     } = {}
   ) {
     super()
@@ -579,7 +692,14 @@ export class WebrtcProvider extends Observable {
     this.signalingUrls = signaling
     this.signalingConns = []
     this.maxConns = maxConns
+    this.idToken = idToken
     this.peerOpts = peerOpts
+
+    this.jwk = jwk
+    this.publicKey = createPublicKey(jwk)
+    this.clientId = clientId
+    this.redirectUris = redirectUris
+
     /**
      * @type {PromiseLike<CryptoKey | null>}
      */

@@ -58,6 +58,7 @@
   },
   "dependencies": {
     "lib0": "^0.2.42",
+    "openid-client": "^5.4.0",
     "simple-peer": "^9.11.0",
     "y-protocols": "^1.0.5"
   },
